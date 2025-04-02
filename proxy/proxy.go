@@ -43,13 +43,6 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		targetURL.Host = r.Host
 	}
 
-	//// Create new request
-	//proxyURL, err := url.Parse(r.URL.String())
-	//if err != nil {
-	//	http.Error(w, "Invalid URL", http.StatusBadRequest)
-	//	return
-	//}
-
 	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "Error creating request", http.StatusInternalServerError)
@@ -64,6 +57,9 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Устанавливаем Host header
+	proxyReq.Host = targetURL.Hostname()
 
 	// Send request to target
 	client := &http.Client{
@@ -89,7 +85,10 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// Copy response body
-	io.Copy(w, resp.Body)
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("Error copying response body: %v", err)
+	}
 	log.Printf("Response headers: %v", resp.Header)
 }
 
