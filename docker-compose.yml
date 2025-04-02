@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  proxy:
+    build: .
+    ports:
+      - "8080:8080"  # Proxy server
+      - "8000:8000"  # API server
+    volumes:
+      - ./certs:/app/certs  # Mount certificates directory
+    environment:
+      - GO_ENV=production 
