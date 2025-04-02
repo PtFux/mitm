@@ -1,28 +1,131 @@
 package proxy
 
 import (
+	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
+	"proxy/proxy/certs"
 	"strings"
 	"sync"
 )
 
 type ProxyServer struct {
-	requests     map[string]*http.Request
+	// requests хранит историю запросов для последующего анализа
+	requests map[string]*http.Request
+
+	// requestsLock обеспечивает безопасный доступ к requests
 	requestsLock sync.RWMutex
+
+	// certManager управляет SSL/TLS сертификатами
+	certManager *certs.CertManager
+
+	// transport используется для HTTP-запросов
+	transport *http.Transport
+
+	// httpsHandler обрабатывает HTTPS соединения
+	httpsHandler http.HandlerFunc
 }
 
-func NewProxyServer() *ProxyServer {
+// NewProxyServer создает новый экземпляр прокси-сервера с поддержкой HTTPS
+// caCertPath - путь к файлу корневого сертификата CA
+// caKeyPath - путь к файлу приватного ключа CA
+// certDir - директория для хранения сертификатов хостов
+func NewProxyServer(caCertPath, caKeyPath, certDir string) (*ProxyServer, error) {
+	// Инициализируем менеджер сертификатов
+	certManager, err := certs.NewCertManager(caCertPath, caKeyPath, certDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create certificate manager: %w", err)
+	}
+
+	// Создаем транспорт с настройками по умолчанию
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Мы сами проверяем сертификаты
+		},
+	}
+
 	return &ProxyServer{
-		requests: make(map[string]*http.Request),
+		requests:     make(map[string]*http.Request),
+		certManager:  certManager,
+		transport:    transport,
+		httpsHandler: makeHTTPSHandler(certManager, transport),
+	}, nil
+}
+
+// makeHTTPSHandler создает обработчик HTTPS соединений
+func makeHTTPSHandler(certManager *certs.CertManager, transport *http.Transport) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := r.URL.Host
+		if !strings.Contains(host, ":") {
+			host = host + ":443"
+		}
+		hostname := strings.Split(host, ":")[0]
+
+		// Получаем сертификат для хоста
+		cert, err := certManager.GetCert(hostname)
+		if err != nil {
+			http.Error(w, "Failed to get certificate", http.StatusInternalServerError)
+			return
+		}
+
+		// Хайджекаем соединение
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+
+		clientConn, _, err := hijacker.Hijack()
+		if err != nil {
+			http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
+			return
+		}
+
+		// Отправляем 200 Connection established
+		_, _ = clientConn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+
+		// Настраиваем TLS соединение
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			ServerName:   hostname,
+		}
+
+		tlsConn := tls.Server(clientConn, tlsConfig)
+		defer tlsConn.Close()
+
+		// Устанавливаем соединение с целевым сервером
+		targetConn, err := tls.Dial("tcp", host, &tls.Config{
+			ServerName: hostname,
+		})
+		if err != nil {
+			log.Printf("Failed to connect to target: %v", err)
+			return
+		}
+		defer targetConn.Close()
+
+		// Туннелируем данные
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			io.Copy(targetConn, tlsConn)
+		}()
+
+		go func() {
+			defer wg.Done()
+			io.Copy(tlsConn, targetConn)
+		}()
+
+		wg.Wait()
 	}
 }
 
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
-		p.handleHTTPS(w, r)
+		p.httpsHandler(w, r)
 	} else {
 		p.handleHTTP(w, r)
 	}
@@ -93,23 +196,20 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyServer) handleHTTPS(w http.ResponseWriter, r *http.Request) {
-	host := r.Host
+	host := r.URL.Host
 	if !strings.Contains(host, ":") {
 		host = host + ":443"
 	}
+	hostname := strings.Split(host, ":")[0]
 
-	// Connect to target
-	targetConn, err := net.Dial("tcp", host)
+	// Получаем или генерируем сертификат
+	cert, err := p.certManager.GetCert(hostname)
 	if err != nil {
-		http.Error(w, "Error connecting to target", http.StatusBadGateway)
+		http.Error(w, "Failed to get certificate", http.StatusInternalServerError)
 		return
 	}
-	defer targetConn.Close()
 
-	// Send 200 Connection established
-	w.WriteHeader(http.StatusOK)
-
-	// Hijack connection
+	// Хайджекаем соединение
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
@@ -118,14 +218,47 @@ func (p *ProxyServer) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		http.Error(w, "Error hijacking connection", http.StatusInternalServerError)
+		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
 
-	// Start bidirectional copy
-	go io.Copy(targetConn, clientConn)
-	io.Copy(clientConn, targetConn)
+	// Отправляем 200 Connection established
+	_, _ = clientConn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+
+	// Настраиваем TLS
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		ServerName:   hostname,
+	}
+
+	tlsConn := tls.Server(clientConn, tlsConfig)
+	defer tlsConn.Close()
+
+	// Устанавливаем соединение с целевым сервером
+	targetConn, err := tls.Dial("tcp", host, &tls.Config{
+		ServerName: hostname,
+	})
+	if err != nil {
+		log.Printf("Failed to connect to target: %v", err)
+		return
+	}
+	defer targetConn.Close()
+
+	// Туннелируем данные
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(targetConn, tlsConn)
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(tlsConn, targetConn)
+	}()
+
+	wg.Wait()
 }
 
 // GetRequest retrieves a stored request by ID

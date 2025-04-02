@@ -7,8 +7,17 @@ import (
 )
 
 func main() {
+
 	// Create proxy server
-	proxyServer := proxy.NewProxyServer()
+	proxyServer, err := proxy.NewProxyServer(
+		"ca.crt", // Путь к корневому сертификату
+		"ca.key", // Путь к приватному ключу CA
+		"certs",  // Директория для сертификатов хостов
+	)
+
+	if err != nil {
+		log.Fatalf("Failed to create proxy: %v", err)
+	}
 
 	// Create API server
 	apiServer := proxy.NewAPIServer(proxyServer)
